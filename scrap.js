@@ -536,10 +536,20 @@ window.addEventListener("touchend", stopDrag);
 // Call it right after UI is created
 makeUIDraggable();
 
+// Add this at the top, near other flags
+let stopRequested = false; // Used to signal stop request
 
 // --- DOWNLOAD with confirmation ---
 // --- DOWNLOAD with chunked video downloader (safe for large files) ---
 downloadBtn.onclick = async () => {
+    // --- STOP BUTTON HANDLING ---
+    if (scraping && !stopRequested) {
+        // If already downloading and user clicks, we trigger a stop.
+        stopRequested = true;
+        setStatus("⏹ Stopping...", true);
+        return; // The main loop will see stopRequested and break out
+    }
+
     if (urls.length === 0) {
         console.warn("⚠ No images scraped yet!");
         setStatus("No Images", false);
@@ -547,13 +557,23 @@ downloadBtn.onclick = async () => {
         return;
     }
 
+    stopRequested = false; // Reset flag for fresh run
+    scraping = true;
+    paused = false;
+    // Change btn to STOP while downloading
+    downloadBtn.textContent = "⏹ Stop";
+
     const FILES_PER_ZIP = 50; // same as before
     const totalChunks = Math.ceil(urls.length / FILES_PER_ZIP);
 
     if (!window.confirm(
         `Download ${urls.length} files as ${totalChunks} ZIP file(s)?\n\n` +
         `(Chunk-safe mode enabled: supports unlimited file sizes.)`
-    )) return;
+    )) {
+        downloadBtn.textContent = "💾";
+        scraping = false;
+        return;
+    }
 
     // ---- CHUNKED DOWNLOADER -----
     async function fetchChunk(url, start, end) {
@@ -587,6 +607,7 @@ downloadBtn.onclick = async () => {
                     let pos = 0, index = 0;
 
                     while (pos < total) {
+                        if (stopRequested) return reject("Download stopped."); // <--- Added
                         const end = Math.min(pos + CHUNK - 1, total - 1);
                         const part = await fetchChunk(url, pos, end);
 
@@ -619,22 +640,32 @@ downloadBtn.onclick = async () => {
     // ----------------------------
     setStatus("⏳ Downloading...", true);
     const failed = [];
+    let completedUrls = [];
 
+    outerLoop:
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
         const start = chunkIndex * FILES_PER_ZIP;
         const end = Math.min(start + FILES_PER_ZIP, urls.length);
         const group = urls.slice(start, end);
-
         const zip = new JSZip();
 
         for (let i = 0; i < group.length; i++) {
             const url = group[i];
             let filename = url.split("/").pop().split("?")[0] || `file_${start + i}.mp4`;
 
+            if (stopRequested) {
+                // Mark all remaining in this group as failed
+                failed.push(...group.slice(i));
+                // Also mark all URLs in future chunks as failed
+                const afterChunksStart = (chunkIndex + 1) * FILES_PER_ZIP;
+                failed.push(...urls.slice(afterChunksStart));
+                break outerLoop; // save & exit
+            }
+
             try {
                 const blob = await downloadBigFile(url);
                 zip.file(filename, blob);
-
+                completedUrls.push(url);
             } catch (err) {
                 console.error("Chunked download failed:", url, err);
                 failed.push(url);
@@ -643,12 +674,16 @@ downloadBtn.onclick = async () => {
             setStatus(`⏳ File ${start + i + 1}/${urls.length}`);
         }
 
-        const zipBlob = await zip.generateAsync({ type: "blob" });
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(zipBlob);
-        a.download = `files_part${chunkIndex + 1}.zip`;
-        a.click();
-        URL.revokeObjectURL(a.href);
+        // Save completed chunk (partial or full)
+        if (zip.files && Object.keys(zip.files).length > 0) { // check ZIP has files
+            const zipBlob = await zip.generateAsync({ type: "blob" });
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(zipBlob);
+            a.download = `files_part${chunkIndex + 1}.zip`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+        if (stopRequested) break; // End after partial ZIP save if stopped
     }
 
     urls = failed;
@@ -657,13 +692,15 @@ downloadBtn.onclick = async () => {
 
     if (urls.length === 0) {
         clearLastScrapedLocation();
-        setStatus("✅ Done", false);
+        setStatus(stopRequested ? "⏹ Stopped" : "✅ Done", false);
     } else {
-        setStatus(`⚠ ${urls.length} failed`, false);
+        setStatus(stopRequested ? `⏹ Stopped • ${urls.length} failed` : `⚠ ${urls.length} failed`, false);
     }
 
+    downloadBtn.textContent = "💾"; // Restore download button
     scraping = false;
     paused = false;
+    stopRequested = false; // Clean up flag
 };
 
 // --- SCRAPING LOGIC ---
